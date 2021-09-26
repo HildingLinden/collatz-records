@@ -3,8 +3,27 @@
 #include <locale>
 #include <omp.h>
 
+#include <boost/multiprecision/cpp_int.hpp>
+using namespace boost::multiprecision;
+
+int64_t overflowCollatz(int64_t number_, int64_t bufferSize, int16_t &extraSteps) {
+	cpp_int number = number_;
+
+	while (number > bufferSize) {
+		if (number % 2 == 0) {
+			number = number / 2;
+		}
+		else {
+			number = number * 3 + 1;
+		}
+		extraSteps++;
+	}
+
+	return number.convert_to<int64_t>();
+}
+
 int main() {
-	const int64_t bufferSize = 10e8 * 7;
+	const int64_t bufferSize = 1e9*5;
 	const int64_t secondaryBufferSize = 1e6;
 
 	int16_t *distance = static_cast<int16_t *>(malloc(bufferSize * sizeof(int16_t)));
@@ -14,7 +33,7 @@ int main() {
 	distance[0] = 0;
 	distance[1] = 0;
 
-	int64_t largest = distance[0];
+	int16_t largest = distance[0];
 	std::cout << "1 : " << largest << "\n";
 
 	struct separate_thousands : std::numpunct<char> {
@@ -50,11 +69,6 @@ int main() {
 
 			// If odd
 			if (number % 2 == 1) {
-				// Overflow protection
-				if (number > INT64_MAX/3-1) {
-					overflow = true;
-					break;
-				}
 				number = number * 3 + 1;
 			}
 			// If even
@@ -63,22 +77,15 @@ int main() {
 			}
 		}
 
-		if (overflow) {
-			// Sequence went above numeric limit
-			std::cout << "\nOverflown\n";
-			distance[i] = -2;
-		}
-		else {
-			int64_t seqDist = 1;
-			for (; sequenceIdx >= 0; sequenceIdx--) {
-				// *it is -1 if larger than buffersize
-				int64_t integer = sequence[sequenceIdx];
-				if (integer > 0) {
-					distance[integer] = distance[number] + seqDist;
-					bufferSum += distance[number] + seqDist;
-				}
-				seqDist++;
+		int64_t seqDist = 1;
+		for (; sequenceIdx >= 0; sequenceIdx--) {
+			// *it is -1 if larger than buffersize
+			int64_t integer = sequence[sequenceIdx];
+			if (integer > 0) {
+				distance[integer] = distance[number] + seqDist;
+				bufferSum += distance[number] + seqDist;
 			}
+			seqDist++;
 		}
 
 		if (distance[i] > largest) {
@@ -104,16 +111,23 @@ int main() {
 			#pragma omp for 
 			for (int64_t segment = i; segment < (i + secondaryBufferSize); segment++) {
 				int threadId = omp_get_thread_num();
-				int64_t extraSteps = 1;
+				int16_t extraSteps = 1;
 				int64_t number = segment;
-				bool overflow = false;
 
 				for (;;) {
 					// If odd
 					if (number % 2 == 1) {
 						// Overflow protection
 						if (number > INT64_MAX / 3 - 1) {
-							overflow = true;
+							number = overflowCollatz(number, bufferSize, extraSteps);
+
+							int16_t dist = static_cast<int16_t>(distance[number]) + extraSteps;
+							if (dist > largest) {
+								localLargest[threadId].push_back(std::pair<int64_t, int16_t>(segment, dist));
+							}
+
+							std::cout << "\nOverflow when starting with: " << segment << ", with " << dist << " steps" << std::endl;
+
 							break;
 						}
 						number = number * 3 + 1;
@@ -122,9 +136,9 @@ int main() {
 					else {
 						number = number / 2;
 						if (number < bufferSize) {
-							int64_t dist = static_cast<int64_t>(distance[number]) + extraSteps;
+							int16_t dist = static_cast<int16_t>(distance[number]) + extraSteps;
 							if (dist > largest) {
-								localLargest[threadId].push_back(std::pair<int64_t, int64_t>(segment, dist));
+								localLargest[threadId].push_back(std::pair<int64_t, int16_t>(segment, dist));
 							}
 							break;
 						}
@@ -136,7 +150,7 @@ int main() {
 			#pragma omp single
 			{
 				for (int i = 0; i < 8; i++) {
-					for (std::pair<int64_t, int64_t> dist : localLargest[i]) {
+					for (std::pair<int64_t, int16_t> dist : localLargest[i]) {
 						if (dist.second > largest) {
 							largest = dist.second;
 							std::cout << "\r                                                                                           ";//"\33[2K";
