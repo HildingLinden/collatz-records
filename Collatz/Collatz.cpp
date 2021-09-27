@@ -6,6 +6,8 @@
 #include <boost/multiprecision/cpp_int.hpp>
 using namespace boost::multiprecision;
 
+#include "ThreadPool.h"
+
 int64_t overflowCollatz(int64_t number_, int64_t bufferSize, int16_t &extraSteps) {
 	cpp_int number = number_;
 
@@ -23,10 +25,9 @@ int64_t overflowCollatz(int64_t number_, int64_t bufferSize, int16_t &extraSteps
 }
 
 void fillLUT(std::vector<int16_t> &LUT, int16_t &largest) {
-	std::vector<int64_t> sequence;
 
+	std::vector<int64_t> sequence;
 	int64_t LUTSum = 0;
-	int64_t sequenceIdx = -1;
 
 	// Fill the lookup table with distances
 	for (int64_t i = 3; i < LUT.size(); i++) {
@@ -95,7 +96,46 @@ void fillLUT(std::vector<int16_t> &LUT, int16_t &largest) {
 	std::cout << "\r" << "Lookup table filled. Avg steps: " << LUTSum / LUT.size() << "\n";
 }
 
-enum LUT_SIZE: long long { L1 = 16000, L2 = 130000, L3 = 1000000, RAM = 5000000000};
+class multiThreadCollatz {
+	std::vector<int16_t> &LUT, &buffer;
+	int64_t start, end, offset;
+public:
+	multiThreadCollatz(std::vector<int16_t> &LUT_, std::vector<int16_t> &buffer_, int64_t start_, int64_t end_, int64_t offset_) : LUT(LUT_), buffer(buffer_), start(start_), end(end_), offset(offset_) {}
+	~multiThreadCollatz() = default;
+
+	multiThreadCollatz(const multiThreadCollatz &) = delete;
+	multiThreadCollatz &operator=(const multiThreadCollatz &) = delete;
+
+	multiThreadCollatz(multiThreadCollatz &&) = default;
+	multiThreadCollatz &operator=(multiThreadCollatz &&) = default;
+
+	void operator()() {
+		int64_t limit = INT64_MAX / 3;
+		for (int64_t j = start; j < end; j++) {
+			int64_t number = j;
+			int16_t steps = 0;
+
+			while (number > LUT.size()) {
+				if (number % 2 == 0) {
+					number = number / 2;
+				}
+				else {
+					if (number > limit) {
+						number = overflowCollatz(number, buffer.size(), steps);
+						break;
+					}
+					number = number * 3 + 1;
+
+				}
+				steps++;
+			}
+
+			buffer[j - offset] = LUT[number] + steps;
+		}
+	}
+};
+
+enum LUT_SIZE : long long { L1 = 16000, L2 = 130000, L3 = 1000000, RAM = 5000000000 };
 
 int main() {
 	// Adding space as a thousands separator for cout
@@ -107,7 +147,8 @@ int main() {
 	std::cout.imbue(std::locale(std::cout.getloc(), thousands.release()));
 
 	const int64_t LUTSize = LUT_SIZE::RAM;
-	const int64_t bufferSize = 1e6;
+	const int64_t bufferSize = 1e8;
+	const int64_t iterationsPerBlock = 1e6;
 
 	// Allocate memory for the lookup table
 	std::cout << "Allocting " << LUTSize * sizeof(int16_t) << " Bytes of memory" << std::endl;
@@ -122,63 +163,24 @@ int main() {
 	// Fill the lookup table and update the largest distance
 	fillLUT(LUT, largest);
 
-	#pragma omp parallel num_threads(8) 
-	{
-		std::vector<std::pair<int64_t, int64_t>> localLargest[8];
-		for (int64_t i = LUTSize; i < INT64_MAX; i += bufferSize) {
-			#pragma omp for 
-			for (int64_t segment = i; segment < (i + bufferSize); segment++) {
-				int threadId = omp_get_thread_num();
-				int16_t extraSteps = 1;
-				int64_t number = segment;
+	ThreadPool<multiThreadCollatz> pool(8);
+	std::vector<int16_t> buffer(bufferSize);
 
-				for (;;) {
-					// If odd
-					if (number % 2 == 1) {
-						// Overflow protection
-						if (number > INT64_MAX / 3 - 1) {
-							number = overflowCollatz(number, LUTSize, extraSteps);
+	for (int64_t i = LUTSize; i < INT64_MAX; i += bufferSize) {
+		std::cout << "\rCurrently on " << i;
 
-							int16_t dist = static_cast<int16_t>(LUT[number]) + extraSteps;
-							if (dist > largest) {
-								localLargest[threadId].push_back(std::pair<int64_t, int16_t>(segment, dist));
-							}
-
-							break;
-						}
-						number = number * 3 + 1;
-					}
-					// If even
-					else {
-						number = number / 2;
-						if (number < LUTSize) {
-							int16_t dist = static_cast<int16_t>(LUT[number]) + extraSteps;
-							if (dist > largest) {
-								localLargest[threadId].push_back(std::pair<int64_t, int16_t>(segment, dist));
-							}
-							break;
-						}
-					}
-					extraSteps++;
-				}
-			}
-
-			#pragma omp single
-			{
-				for (int i = 0; i < 8; i++) {
-					for (std::pair<int64_t, int16_t> dist : localLargest[i]) {
-						if (dist.second > largest) {
-							largest = dist.second;
-							std::cout << "\r                                                                                           ";//"\33[2K";
-							std::cout << "\r" << dist.first << " : " << dist.second << "\n";
-						}
-					}
-					localLargest[i].clear();
-				}
-
-				std::cout << "\rCurrently on: " << i << " " << std::flush;
-			}
+		for (int64_t j = i; j < (i + bufferSize); j += iterationsPerBlock) {
+			pool.addWork(multiThreadCollatz(LUT, buffer, j, j + iterationsPerBlock, i));
 		}
 
+		pool.waitForThreads();
+
+		for (int64_t j = 0; j < bufferSize; j++) {
+			if (buffer[j] > largest) {
+				largest = buffer[j];
+				std::cout << "\r                                                                                           ";//"\33[2K";
+				std::cout << "\r" << i + j << " : " << buffer[j] << std::endl;
+			}
+		}
 	}
 }
