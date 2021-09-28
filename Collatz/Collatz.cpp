@@ -11,6 +11,11 @@ using namespace boost::multiprecision;
 // Included from collat_asm.asm (.o/.obj)
 int16_t collatz(uint64_t *, int64_t);
 
+struct record_t {
+	int64_t number;
+	int16_t steps;
+};
+
 int64_t overflowCollatz(uint64_t number_, int64_t bufferSize, int16_t &extraSteps) {
 	cpp_int number = number_;
 
@@ -27,7 +32,7 @@ int64_t overflowCollatz(uint64_t number_, int64_t bufferSize, int16_t &extraStep
 	return number.convert_to<int64_t>();
 }
 
-void fillLUT(std::vector<int16_t> &LUT, int16_t &largest) {
+void fillLUT(std::vector<int16_t> &LUT, record_t &largest) {
 
 	std::vector<int64_t> sequence;
 	int64_t LUTSum = 0;
@@ -37,12 +42,12 @@ void fillLUT(std::vector<int16_t> &LUT, int16_t &largest) {
 
 		// If the number has already been added to the look up table
 		if (LUT[i] != 0) {
-			if (LUT[i] > largest) {
-				largest = LUT[i];
+			if (LUT[i] > largest.steps) {
+				largest.steps = LUT[i];
+				largest.number = i;
 				// VT100 escape character for clearing line only works if running through visual studio
 				std::cout << "\r                                                                                           ";//"\33[2K";
-				std::cout << "\r" << i << " : " << largest << "\n";
-				std::cout << "Currently on: " << i << " " << std::flush;
+				std::cout << "\r" << largest.number << " : " << largest.steps << "\n";
 			}
 			continue;
 		}
@@ -83,11 +88,12 @@ void fillLUT(std::vector<int16_t> &LUT, int16_t &largest) {
 
 		sequence.clear();
 
-		if (LUT[i] > largest) {
-			largest = LUT[i];
+		if (LUT[i] > largest.steps) {
+			largest.steps = LUT[i];
+			largest.number = i;
 			// VT100 escape character for clearing line only works if running through visual studio
 			std::cout << "\r                                                                                           ";//"\33[2K";
-			std::cout << "\r" << i << " : " << largest << "\n";
+			std::cout << "\r" << i << " : " << largest.steps << "\n";
 			std::cout << "Filling lookup table. Currently on: " << i << " of " << LUT.size() << std::flush;
 		}
 		else if (i % 1000000 == 0) {
@@ -100,17 +106,13 @@ void fillLUT(std::vector<int16_t> &LUT, int16_t &largest) {
 }
 
 class multiThreadCollatz {
-	std::vector<int16_t> &LUT, &buffer;
-	int64_t start, end, offset;
 public:
-	multiThreadCollatz(std::vector<int16_t> &LUT_, std::vector<int16_t> &buffer_, int64_t start_, int64_t end_, int64_t offset_) : LUT(LUT_), buffer(buffer_), start(start_), end(end_), offset(offset_) {}
-	~multiThreadCollatz() = default;
-
-	multiThreadCollatz(const multiThreadCollatz &) = delete;
-	multiThreadCollatz &operator=(const multiThreadCollatz &) = delete;
-
-	multiThreadCollatz(multiThreadCollatz &&) = default;
-	multiThreadCollatz &operator=(multiThreadCollatz &&) = default;
+	std::vector<int16_t> &LUT;
+	std::vector<std::vector<record_t>> &potentialRecords;
+	int64_t start;
+	int64_t end;
+	int64_t blockIndex;
+	record_t largest;
 
 	void operator()() {
 		for (int64_t j = start; j < end; j++) {
@@ -121,7 +123,11 @@ public:
 				number = overflowCollatz(number, LUT.size(), steps);
 			}
 
-			buffer[j - offset] = LUT[number] + steps;
+			int16_t totalSteps = LUT[number] + steps;
+			if (totalSteps > largest.steps) {
+				largest = record_t{ j, totalSteps };
+				potentialRecords[blockIndex].push_back(largest);
+			}
 		}
 	}
 };
@@ -138,66 +144,52 @@ int main() {
 	std::cout.imbue(std::locale(std::cout.getloc(), thousands.release()));
 
 	const int64_t LUTSize = LUT_SIZE::RAM;
-	const int64_t bufferSize = 1e7*5;
-	const int64_t iterationsPerBlock = 1e5;
+	const int64_t blocks = 100;
+	const int64_t iterationsPerBlock = 1e6;
 
 	// Allocate memory for the lookup table
 	std::cout << "Allocting " << LUTSize * sizeof(int16_t) << " Bytes of memory" << std::endl;
 	std::vector<int16_t> LUT(LUTSize);
 
 	// Setting up the beginning of the lookup table
-	LUT[2] = 1;
-	int16_t largest = LUT[2];
+	LUT[2] = 1;	
 	std::cout << "1 : " << LUT[1] << std::endl;
 	std::cout << "2 : " << LUT[2] << std::endl;
+	record_t largest{ 2, LUT[2] };
 
 	// Fill the lookup table and update the largest distance
 	fillLUT(LUT, largest);
 
 	ThreadPool<multiThreadCollatz> pool(10);
-	std::vector<int16_t> buffer(bufferSize);
-	std::vector<int16_t> buffer2(bufferSize);
+	
+	// Each block stores all potential records in their own vector
+	std::vector<std::vector<record_t>> potentialRecords(blocks);
 
-	for (int64_t i = LUTSize; i < INT64_MAX; i += bufferSize * 2) {
+	std::vector<record_t> records;
+	for (int64_t i = LUTSize; i < INT64_MAX; i += (blocks * iterationsPerBlock)) {
 		std::cout << "\rCurrently on " << i << std::flush;
 
 		// Start filling buffer 1
-		for (int64_t j = i; j < (i + bufferSize); j += iterationsPerBlock) {
-			pool.addWork(multiThreadCollatz(LUT, buffer, j, j + iterationsPerBlock, i));
-		}		
-		
-		// Check buffer 2 
-		for (int64_t j = 0; j < bufferSize; j++) {
-			if (buffer2[j] > largest) {
-				largest = buffer2[j];
-				std::cout << "\r                                                                                           ";//"\33[2K";
-				std::cout << "\r" << i + j << " : " << buffer2[j] << std::endl;
-				std::cout << "\rCurrently on " << i << std::flush;
-			}
+		for (int64_t blockIndex = 0; blockIndex < blocks; blockIndex++) {
+			pool.addWork(multiThreadCollatz{ LUT, potentialRecords, i + blockIndex * iterationsPerBlock, i + (blockIndex + 1) * iterationsPerBlock, blockIndex, largest });
 		}
 
-		// Wait for buffer 1 to finish
 		pool.waitForThreads();
 
-		std::cout << "\rCurrently on " << i + bufferSize << std::flush;
-
-		// Start filling buffer 2
-		for (int64_t j = (i + bufferSize); j < (i + bufferSize * 2); j += iterationsPerBlock) {
-			pool.addWork(multiThreadCollatz(LUT, buffer2, j, j + iterationsPerBlock, i+bufferSize));
+		// Combine all potential records in a vector and sort it		
+		for (std::vector<record_t> &blockRecords : potentialRecords) {
+			std::copy(blockRecords.begin(), blockRecords.end(), std::back_inserter(records));
+			blockRecords.clear();
 		}
+		std::sort(records.begin(), records.end(), [](record_t const &rhs, record_t const &lhs) { return rhs.number < lhs.number; });
 
-		// Check buffer 1 
-		for (int64_t j = 0; j < bufferSize; j++) {
-			if (buffer[j] > largest) {
-				largest = buffer[j];
+		for (const record_t record : records) {
+			if (record.steps > largest.steps) {
+				largest = record;
 				std::cout << "\r                                                                                           ";//"\33[2K";
-				std::cout << "\r" << i + j << " : " << buffer[j] << std::endl;
-				std::cout << "\rCurrently on " << i + bufferSize << std::flush;
+				std::cout << "\r" << largest.number << " : " << largest.steps << std::endl;
 			}
 		}
-
-		// Wait for buffer 2 to finish
-		pool.waitForThreads();
-		
+		records.clear();
 	}
 }
