@@ -8,7 +8,10 @@ using namespace boost::multiprecision;
 
 #include "ThreadPool.h"
 
-int64_t overflowCollatz(int64_t number_, int64_t bufferSize, int16_t &extraSteps) {
+// Included from collat_asm.asm (.o/.obj)
+int16_t collatz(uint64_t *, int64_t);
+
+int64_t overflowCollatz(uint64_t number_, int64_t bufferSize, int16_t &extraSteps) {
 	cpp_int number = number_;
 
 	while (number > bufferSize) {
@@ -110,24 +113,12 @@ public:
 	multiThreadCollatz &operator=(multiThreadCollatz &&) = default;
 
 	void operator()() {
-		int64_t limit = INT64_MAX / 3;
 		for (int64_t j = start; j < end; j++) {
-			int64_t number = j;
-			int16_t steps = 0;
+			uint64_t number = j;
 
-			while (number > LUT.size()) {
-				if (number % 2 == 0) {
-					number = number / 2;
-				}
-				else {
-					if (number > limit) {
-						number = overflowCollatz(number, buffer.size(), steps);
-						break;
-					}
-					number = number * 3 + 1;
-
-				}
-				steps++;
+			int16_t steps = collatz(&number, LUT.size());
+			if (number > LUT.size()) {
+				number = overflowCollatz(number, LUT.size(), steps);
 			}
 
 			buffer[j - offset] = LUT[number] + steps;
@@ -147,8 +138,8 @@ int main() {
 	std::cout.imbue(std::locale(std::cout.getloc(), thousands.release()));
 
 	const int64_t LUTSize = LUT_SIZE::RAM;
-	const int64_t bufferSize = 1e8;
-	const int64_t iterationsPerBlock = 1e6;
+	const int64_t bufferSize = 1e7*5;
+	const int64_t iterationsPerBlock = 1e5;
 
 	// Allocate memory for the lookup table
 	std::cout << "Allocting " << LUTSize * sizeof(int16_t) << " Bytes of memory" << std::endl;
@@ -163,24 +154,50 @@ int main() {
 	// Fill the lookup table and update the largest distance
 	fillLUT(LUT, largest);
 
-	ThreadPool<multiThreadCollatz> pool(8);
+	ThreadPool<multiThreadCollatz> pool(10);
 	std::vector<int16_t> buffer(bufferSize);
+	std::vector<int16_t> buffer2(bufferSize);
 
-	for (int64_t i = LUTSize; i < INT64_MAX; i += bufferSize) {
-		std::cout << "\rCurrently on " << i;
+	for (int64_t i = LUTSize; i < INT64_MAX; i += bufferSize * 2) {
+		std::cout << "\rCurrently on " << i << std::flush;
 
+		// Start filling buffer 1
 		for (int64_t j = i; j < (i + bufferSize); j += iterationsPerBlock) {
 			pool.addWork(multiThreadCollatz(LUT, buffer, j, j + iterationsPerBlock, i));
+		}		
+		
+		// Check buffer 2 
+		for (int64_t j = 0; j < bufferSize; j++) {
+			if (buffer2[j] > largest) {
+				largest = buffer2[j];
+				std::cout << "\r                                                                                           ";//"\33[2K";
+				std::cout << "\r" << i + j << " : " << buffer2[j] << std::endl;
+				std::cout << "\rCurrently on " << i << std::flush;
+			}
 		}
 
+		// Wait for buffer 1 to finish
 		pool.waitForThreads();
 
+		std::cout << "\rCurrently on " << i + bufferSize << std::flush;
+
+		// Start filling buffer 2
+		for (int64_t j = (i + bufferSize); j < (i + bufferSize * 2); j += iterationsPerBlock) {
+			pool.addWork(multiThreadCollatz(LUT, buffer2, j, j + iterationsPerBlock, i+bufferSize));
+		}
+
+		// Check buffer 1 
 		for (int64_t j = 0; j < bufferSize; j++) {
 			if (buffer[j] > largest) {
 				largest = buffer[j];
 				std::cout << "\r                                                                                           ";//"\33[2K";
 				std::cout << "\r" << i + j << " : " << buffer[j] << std::endl;
+				std::cout << "\rCurrently on " << i + bufferSize << std::flush;
 			}
 		}
+
+		// Wait for buffer 2 to finish
+		pool.waitForThreads();
+		
 	}
 }
