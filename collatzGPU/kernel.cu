@@ -89,15 +89,16 @@ void fillLUT(std::vector<int16_t> &LUT) {
 	std::cout << "\rFilled the lookup table with " << LUT.size() << " entries" << std::endl;
 }
 
-__global__ void collatzGPU(int16_t *recordNums, record_t *records, int64_t offset, int16_t largest) {
+__global__ void collatzGPU(int16_t *LUT, int16_t *recordNums, record_t *records, int64_t offset, int16_t largest) {
 	int64_t idx = ((blockIdx.x * blockDim.x) + threadIdx.x);
 
 	recordNums[idx] = 0;
 	for (int64_t i = 0; i < iterationsPerThread; i++) {
 		int64_t number = idx * iterationsPerThread + i + offset;
 		int16_t steps = 0;
+		bool overflow = false;
 
-		while (number > 1) {
+		while (number > 3000000000) {
 			if (number % 2 == 0) {
 				number = number / 2;
 			}
@@ -106,11 +107,14 @@ __global__ void collatzGPU(int16_t *recordNums, record_t *records, int64_t offse
 					records[idx * 100 + recordNums[idx]].number = idx * iterationsPerThread + i + offset;
 					records[idx * 100 + recordNums[idx]].steps = -1;
 					recordNums[idx]++;
-					steps = 0;
 					if (recordNums[idx] == 100) {
 						recordNums[idx] = -1;
 						return;
 					}
+
+					steps = 0;
+					overflow = true;
+
 					break;
 				}
 				number = number * 3 + 1;
@@ -118,14 +122,17 @@ __global__ void collatzGPU(int16_t *recordNums, record_t *records, int64_t offse
 			steps++;
 		}
 
-		if (steps > largest) {
-			largest = steps;
-			records[idx * 100 + recordNums[idx]].number = idx * iterationsPerThread + i + offset;
-			records[idx * 100 + recordNums[idx]].steps = steps;
-			recordNums[idx]++;
-			if (recordNums[idx] == 100) {
-				recordNums[idx] = -1;
-				return;
+		if (!overflow) {
+			steps = steps + LUT[number];
+			if (steps > largest) {
+				largest = steps;
+				records[idx * 100 + recordNums[idx]].number = idx * iterationsPerThread + i + offset;
+				records[idx * 100 + recordNums[idx]].steps = steps;
+				recordNums[idx]++;
+				if (recordNums[idx] == 100) {
+					recordNums[idx] = -1;
+					return;
+				}
 			}
 		}
 	}
@@ -256,21 +263,35 @@ int main(int argc, char *argv[]) {
 
 	int16_t *recordNums;
 	record_t *records;
+	int16_t *devLUT;
 
 	cudaError_t cudaStatus = cudaMallocManaged(&recordNums, bufferSize * sizeof(int16_t));
 	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaMalloc failed!");
+		fprintf(stderr, "cudaMallocManaged failed!");
 		exit(1);
 	}
 
 	cudaStatus = cudaMallocManaged(&records, 100 * bufferSize * sizeof(record_t));
 	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMallocManaged failed!");
+		exit(1);
+	}
+
+	cudaStatus = cudaMalloc(&devLUT, 3000000000 * sizeof(int16_t));
+	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
 		exit(1);
 	}
 
-	int64_t overflowCount = 0;
+	cudaStatus = cudaMemcpy(devLUT, LUT.data(), 3000000000 * sizeof(int16_t), cudaMemcpyHostToDevice);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "memcpy failed!");
+		exit(1);
+	}
+
 	for (int64_t i = startingNumber; i < INT64_MAX; i += bufferSize * iterationsPerThread) {
+		int64_t overflowCount = 0;
+
 		if (_kbhit()) {
 			std::chrono::time_point endTime = std::chrono::steady_clock::now();
 			std::chrono::duration<long long> time = std::chrono::duration_cast<std::chrono::seconds>(endTime - startTime);
@@ -287,10 +308,10 @@ int main(int argc, char *argv[]) {
 			exit(0);
 		}
 
-		std::cout << "\rCurrently on " << i << ", overflows: " << overflowCount;
+		std::cout << "\rCurrently on " << i << ", overflows per buffer: " << overflowCount;
 
 		
-		collatzGPU <<<blocks, threads>>> (recordNums, records, i, largest);
+		collatzGPU <<<blocks, threads>>> (devLUT, recordNums, records, i, largest);
 
 		cudaStatus = cudaGetLastError();
 		if (cudaStatus != cudaSuccess) {
