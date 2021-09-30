@@ -1,5 +1,4 @@
-﻿
-#include "cuda_runtime.h"
+﻿#include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 
 #include <stdio.h>
@@ -12,89 +11,83 @@
 #include <string>
 #include <chrono>
 
-__global__ void collatzBitSet(unsigned long long int *result, const int largest, const unsigned long long int offset, const int iterationsPerThread) {
-	int idx = (blockIdx.x * blockDim.x) + threadIdx.x;
-	int64_t resultBitset = 0;
+#include <boost/multiprecision/cpp_int.hpp>
+using namespace boost::multiprecision;
 
-	for (int i = 0; i < iterationsPerThread; i++) {
-		long long int number = offset + idx * iterationsPerThread + i;
-		int steps = -1;
+#include "ThreadPool.h"
 
-		while (true) {
-			steps++;
+// Included from collatz_asm.asm (.o/.obj)
+int16_t collatz(uint64_t *, int64_t);
 
-			// If odd
-			if (number % 2 == 1) {
-				number = number * 3 + 1;
-			}
-			// If even
-			else {
+struct record_t {
+	int16_t steps;
+	int64_t number;
+};
+
+constexpr int64_t iterationsPerThread = 1000;
+
+__global__ void collatzGPU(int16_t *recordNums, record_t *records, int64_t offset, int16_t largest) {
+	int64_t idx = ((blockIdx.x * blockDim.x) + threadIdx.x);
+
+	recordNums[idx] = 0;
+	for (int64_t i = 0; i < iterationsPerThread; i++) {
+		int64_t number = idx * iterationsPerThread + i + offset;
+		int16_t steps = 0;
+
+		while (number > 1) {
+			if (number % 2 == 0) {
 				number = number / 2;
-				if (number < 2) {
-					if (steps > largest) {
-						//printf("\n%llu\n", offset + idx * 64 + i);
-						//atomicOr(&result[idx], 1ULL << i);
-						resultBitset |= 1ULL << i;
+			}
+			else {
+				if (number > INT64_MAX / 3 + 1) {
+					records[idx * 100 + recordNums[idx]].number = idx * iterationsPerThread + i + offset;
+					records[idx * 100 + recordNums[idx]].steps = -1;
+					recordNums[idx]++;
+					steps = 0;
+					if (recordNums[idx] == 100) {
+						recordNums[idx] = -1;
+						return;
 					}
 					break;
 				}
+				number = number * 3 + 1;
+			}
+			steps++;
+		}
+
+		if (steps > largest) {
+			largest = steps;
+			records[idx * 100 + recordNums[idx]].number = idx * iterationsPerThread + i + offset;
+			records[idx * 100 + recordNums[idx]].steps = steps;
+			recordNums[idx]++;
+			if (recordNums[idx] == 100) {
+				recordNums[idx] = -1;
+				return;
 			}
 		}
 	}
-
-	result[idx] = resultBitset;
 }
 
-int collatzDistance(int64_t number) {
-	int steps = 0;
-	while (true) {
-		if (number < 2) {
-			return steps;
-		}
+int64_t overflowCollatz(int64_t number_, int64_t bufferSize, int16_t &extraSteps) {
+	cpp_int number = number_;
 
+	while (number > bufferSize) {
 		if (number % 2 == 0) {
 			number = number / 2;
 		}
 		else {
 			number = number * 3 + 1;
 		}
-		steps++;
-	}	
-}
-
-
-int main(int argc, char *argv[])
-{
-	struct separate_thousands : std::numpunct<char> {
-		char_type do_thousands_sep() const override { return ' '; }  // separate with space
-		string_type do_grouping() const override { return "\3"; } // groups of 3 digit
-	};
-
-	auto thousands = std::make_unique<separate_thousands>();
-	std::cout.imbue(std::locale(std::cout.getloc(), thousands.release()));
-
-	std::chrono::duration<long long> totalTime = std::chrono::seconds(0);
-	auto startTime = std::chrono::steady_clock::now();
-
-	uint64_t *steps;
-	const int blocks = 1024;
-	const int threads = 512;
-	const int segmentSize = blocks * threads;
-	const int iterationsPerThread = 64;
-	const int64_t maxNumber = 10e17;
-	int64_t startingNumber = 0;
-	int largest = 0;
-	int64_t largestRecord = 0;
-	bool resumeComputation = false;
-
-	cudaError_t cudaStatus = cudaMallocManaged(&steps, segmentSize * sizeof(uint64_t));
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaMalloc failed!");
-		exit(1);
+		extraSteps++;
 	}
 
+	return number.convert_to<int64_t>();
+}
+
+std::ofstream checkProgressFile(int16_t &largest, int64_t &startingNumber, std::chrono::duration<long long> &totalTime, bool &resumeComputation) {
 	// Check if result files exists and save everything else but the last row
 	if (std::filesystem::exists("collatz_results.txt")) {
+
 		std::ifstream inputFile;
 		inputFile.open("collatz_results.txt");
 		if (!inputFile.is_open()) {
@@ -110,24 +103,25 @@ int main(int argc, char *argv[])
 		}
 
 		std::string str;
+		int64_t recordNumber;
 		while (getline(inputFile, str)) {
 			if (str.find("end") == std::string::npos) {
 				if (!str.empty()) {
-					largest = std::stol(str.substr(str.find(" ")));
-					largestRecord = std::stoll(str.substr(0, str.find(" ")));
+					largest = std::stoi(str.substr(str.find(" ")));
+					recordNumber = std::stoll(str.substr(0, str.find(" ")));
 					tmpFile << str << "\n";
 				}
 			}
 			else {
 				startingNumber = std::stoll(str.substr(0, str.find(" ")));
-				totalTime = std::chrono::seconds(std::stoll(str.substr(str.find("-")+1)));
-				resumeComputation = true; 
-				
+				totalTime = std::chrono::seconds(std::stoll(str.substr(str.find("-") + 1)));
+				resumeComputation = true;
+
 				std::time_t t = std::time(nullptr);
 				std::tm tm = *std::localtime(&t);
 
 				std::cout << "Previous total execution time: " << totalTime.count() << " seconds" << std::endl;
-				std::cout << "Largest previous record: " << largestRecord << " : " << largest << std::endl;
+				std::cout << "Largest previous record: " << recordNumber << " : " << largest << std::endl;
 				std::cout << std::put_time(&tm, "\n[%T] Resuming from: ") << startingNumber << std::endl;
 			}
 		}
@@ -142,7 +136,7 @@ int main(int argc, char *argv[])
 		if (rename("tmpFile", "collatz_results.txt") != 0) {
 			std::cout << "Could not rename temporary file" << std::endl;
 			exit(EXIT_FAILURE);
-		}		
+		}
 	}
 
 	std::ofstream resultFile;
@@ -153,34 +147,69 @@ int main(int argc, char *argv[])
 		exit(EXIT_FAILURE);
 	}
 
+	return resultFile;
+}
 
+int main(int argc, char *argv[]) {
+	std::chrono::duration<long long> totalTime = std::chrono::seconds(0);
+	auto startTime = std::chrono::steady_clock::now();
+
+	struct separate_thousands : std::numpunct<char> {
+		char_type do_thousands_sep() const override { return ' '; }  // separate with space
+		string_type do_grouping() const override { return "\3"; } // groups of 3 digit
+	};
+
+	auto thousands = std::make_unique<separate_thousands>();
+	std::cout.imbue(std::locale(std::cout.getloc(), thousands.release()));
+
+	int16_t largest = 0;
+	int64_t startingNumber = 100000000;
+	bool resumeComputation = false;	
+	
+	std::ofstream resultFile = checkProgressFile(largest, startingNumber, totalTime, resumeComputation);
+
+	// Computer the first 100 000 000 on CPU to give a higher cutoff for the GPU
 	if (!resumeComputation) {
-		// Start by computing some distance on CPU so that the kernels have a decently high cutoff
-		for (int i = 0; i < 10000000; i++) {
-			int dist = collatzDistance(i);
-			if (dist > largest) {
-				largest = dist;
-
-				std::time_t t = std::time(nullptr);
-				std::tm tm = *std::localtime(&t);
-
-				std::cout << std::put_time(&tm, "[%T] ") << i << " : " << largest << std::endl;
-				resultFile << i << " " << largest << "\n";
+		for (int i = 0; i < startingNumber; i++) {
+			int16_t steps = 0;
+			overflowCollatz(i, 1, steps);
+			if (steps > largest) {
+				largest = steps;
+				std::cout << "\r                                                                                ";
+				std::cout << "\r" << i << " : " << steps << std::endl;
+				resultFile << i << " " << steps << std::endl;
 			}
 		}
 	}
 
-	int segment = 0;
-	while (true) {
-		uint64_t offset = (uint64_t)segment * (uint64_t)segmentSize * iterationsPerThread + startingNumber;
+	const int64_t blocks = 1000;
+	const int64_t threads = 100;
+	const int64_t bufferSize = blocks * threads;
 
+	int16_t *recordNums;
+	record_t *records;	
+
+	cudaError_t cudaStatus = cudaMallocManaged(&recordNums, bufferSize * sizeof(int16_t));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		exit(1);
+	}
+
+	cudaStatus = cudaMallocManaged(&records, 100 * bufferSize * sizeof(record_t));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		exit(1);
+	}
+	
+	int64_t overflowCount = 0;
+	for (int64_t i = startingNumber; i < INT64_MAX; i += bufferSize * iterationsPerThread) {		
 		if (_kbhit()) {
 			std::chrono::time_point endTime = std::chrono::steady_clock::now();
 			std::chrono::duration<long long> time = std::chrono::duration_cast<std::chrono::seconds>(endTime - startTime);
 			totalTime += time;
 
-			std::cout << "\n\nSaving on: " << offset << std::endl;
-			resultFile << offset << " end-" << totalTime.count() << std::endl;
+			std::cout << "\n\nSaving on: " << i << std::endl;
+			resultFile << i << " end-" << totalTime.count() << std::endl;
 
 
 			resultFile.close();
@@ -190,45 +219,49 @@ int main(int argc, char *argv[])
 			exit(0);
 		}
 
-		collatzBitSet <<< blocks, threads >>> (steps, largest, offset, iterationsPerThread);
+		std::cout << "\rCurrently on " << i << ", overflows: " << overflowCount;
+
+		
+		collatzGPU <<<blocks, threads>>> (recordNums, records, i, largest);
 
 		cudaStatus = cudaGetLastError();
 		if (cudaStatus != cudaSuccess) {
-			fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
+			fprintf(stderr, "collatzGPU launch failed: %s\n", cudaGetErrorString(cudaStatus));
 			exit(1);
 		}
 
 		cudaStatus = cudaDeviceSynchronize();
 		if (cudaStatus != cudaSuccess) {
-			fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel!\n", cudaStatus);
+			fprintf(stderr, "cudaDeviceSynchronize returned error %s, after launching collatzGPU!\n", cudaGetErrorString(cudaStatus));
 			exit(1);
 		}
 
-		for (int i = 0; i < segmentSize; i++) {
-			uint64_t number = steps[i];
-			if (number) {
-				std::bitset<64> bits(number);
-				for (int j = 0; j < iterationsPerThread; j++) {
-					if (bits[j]) {
-						int distance = collatzDistance(offset + i * iterationsPerThread + j);
-						if (distance > largest) {
-							largest = distance;
-
-							std::time_t t = std::time(nullptr);
-							std::tm tm = *std::localtime(&t);
-
-							std::cout << "\r                                                                     ";
-							std::cout << "\r" << std::put_time(&tm, "[%T] ") << offset + i * iterationsPerThread + j << " : " << largest << std::endl;
-							std::cout << "\rCurrently on : " << offset;
-							resultFile << offset + i * iterationsPerThread + j << " " << largest << "\n";
+		for (int64_t i = 0; i < bufferSize; i++) {
+			int16_t recordNum = recordNums[i];
+			if (recordNum < 0) {
+				std::cout << "Negative" << std::endl;
+			} 
+			else if (recordNum > 0) {
+				for (int16_t record = 0; record < recordNum; record++) {
+					if (records[i * 100 + record].steps < 0) {
+						overflowCount++;
+						int16_t steps = 0;
+						int64_t number = overflowCollatz(records[i * 100 + record].number, 1, steps);
+						if (steps > largest) {
+							largest = steps;
+							std::cout << "\r                                                                                ";
+							std::cout << "\r" << records[i * 100 + record].number << " : " << steps << std::endl;
+							resultFile << records[i * 100 + record].number << " " << steps << std::endl;
 						}
+					}
+					else if (records[i * 100 + record].steps > largest) {
+						largest = records[i * 100 + record].steps;
+						std::cout << "\r                                                                                ";
+						std::cout << "\r" << records[i * 100 + record].number << " : " << records[i * 100 + record].steps << std::endl;
+						resultFile << records[i * 100 + record].number << " " << records[i * 100 + record].steps << std::endl;
 					}
 				}
 			}
 		}
-
-		std::cout << "\rCurrently on : " << offset;
-
-		segment++;
 	}
 }
