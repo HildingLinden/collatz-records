@@ -26,6 +26,69 @@ struct record_t {
 
 constexpr int64_t iterationsPerThread = 1000;
 
+__global__ void fillLUTGPU(int16_t *LUT, int64_t offset) {
+	int64_t idx = ((blockIdx.x * blockDim.x) + threadIdx.x);
+	idx *= 50000;
+
+	for (int64_t i = 0; i < 50000; i++) {
+		int64_t number = idx + i + offset;
+		int16_t steps = 0;
+
+		while (number > 1) {
+			if (number % 2 == 0) {
+				number = number / 2;
+			}
+			else {
+				number = number * 3 + 1;
+			}
+			steps++;
+		}
+
+		LUT[idx + i] = steps;
+	}
+}
+
+void fillLUT(std::vector<int16_t> &LUT) {
+	int16_t *devLUT;
+	cudaMalloc(&devLUT, (LUT.size() / 10) * sizeof(int16_t));
+
+	std::cout << "Filling lookup table" << std::endl;
+
+	for (int64_t i = 0; i < 10; i++) {
+		int64_t offset = i * 500000000;
+
+		std::cout << "\rCurrently on " << offset << " of " << LUT.size();
+
+		fillLUTGPU << < 100, 100 >> > (devLUT, offset);
+
+		cudaError_t cudaStatus = cudaGetLastError();
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "fillLUTGPU launch failed: %s\n", cudaGetErrorString(cudaStatus));
+			exit(1);
+		}
+
+		cudaStatus = cudaDeviceSynchronize();
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "cudaDeviceSynchronize returned error %s, after fillLUTGPU\n", cudaGetErrorString(cudaStatus));
+			exit(1);
+		}
+
+		cudaStatus = cudaMemcpy(LUT.data() + offset, devLUT, (LUT.size() / 10) * sizeof(int16_t), cudaMemcpyDefault);
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "cudaMemcpy returned error %s, after fillLUTGPU\n", cudaGetErrorString(cudaStatus));
+			exit(1);
+		}
+	}
+
+	cudaError_t cudaStatus = cudaFree(devLUT);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMemcpy returned error %s, after fillLUTGPU\n", cudaGetErrorString(cudaStatus));
+		exit(1);
+	}
+
+	std::cout << "\rFilled the lookup table with " << LUT.size() << " entries" << std::endl;
+}
+
 __global__ void collatzGPU(int16_t *recordNums, record_t *records, int64_t offset, int16_t largest) {
 	int64_t idx = ((blockIdx.x * blockDim.x) + threadIdx.x);
 
@@ -162,22 +225,27 @@ int main(int argc, char *argv[]) {
 	auto thousands = std::make_unique<separate_thousands>();
 	std::cout.imbue(std::locale(std::cout.getloc(), thousands.release()));
 
+	const int64_t size = 5000000000;
+	std::vector<int16_t> LUT(size);
+
 	int16_t largest = 0;
-	int64_t startingNumber = 100000000;
-	bool resumeComputation = false;	
-	
+	int64_t startingNumber = LUT.size();
+	bool resumeComputation = false;
+
 	std::ofstream resultFile = checkProgressFile(largest, startingNumber, totalTime, resumeComputation);
 
-	// Computer the first 100 000 000 on CPU to give a higher cutoff for the GPU
-	if (!resumeComputation) {
-		for (int i = 0; i < startingNumber; i++) {
-			int16_t steps = 0;
-			overflowCollatz(i, 1, steps);
-			if (steps > largest) {
-				largest = steps;
-				std::cout << "\r                                                                                ";
-				std::cout << "\r" << i << " : " << steps << std::endl;
-				resultFile << i << " " << steps << std::endl;
+	fillLUT(LUT);
+
+	int64_t lutSum = 0;
+	for (int64_t i = 0; i < LUT.size(); i++) {
+		lutSum += LUT[i];
+
+		// Find records in LUT if starting from scratch
+		if (!resumeComputation) {
+			if (LUT[i] > largest) {
+				largest = LUT[i];
+				std::cout << i << " : " << largest << std::endl;
+				resultFile << i << " " << largest << std::endl;
 			}
 		}
 	}
@@ -187,7 +255,7 @@ int main(int argc, char *argv[]) {
 	const int64_t bufferSize = blocks * threads;
 
 	int16_t *recordNums;
-	record_t *records;	
+	record_t *records;
 
 	cudaError_t cudaStatus = cudaMallocManaged(&recordNums, bufferSize * sizeof(int16_t));
 	if (cudaStatus != cudaSuccess) {
@@ -200,9 +268,9 @@ int main(int argc, char *argv[]) {
 		fprintf(stderr, "cudaMalloc failed!");
 		exit(1);
 	}
-	
+
 	int64_t overflowCount = 0;
-	for (int64_t i = startingNumber; i < INT64_MAX; i += bufferSize * iterationsPerThread) {		
+	for (int64_t i = startingNumber; i < INT64_MAX; i += bufferSize * iterationsPerThread) {
 		if (_kbhit()) {
 			std::chrono::time_point endTime = std::chrono::steady_clock::now();
 			std::chrono::duration<long long> time = std::chrono::duration_cast<std::chrono::seconds>(endTime - startTime);
@@ -240,7 +308,7 @@ int main(int argc, char *argv[]) {
 			int16_t recordNum = recordNums[i];
 			if (recordNum < 0) {
 				std::cout << "Negative" << std::endl;
-			} 
+			}
 			else if (recordNum > 0) {
 				for (int16_t record = 0; record < recordNum; record++) {
 					if (records[i * 100 + record].steps < 0) {
